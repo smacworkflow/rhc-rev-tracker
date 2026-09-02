@@ -106,7 +106,7 @@ def usd(v, d=0):
 
 
 def num(v, d=0):
-    return "—" if v is None else f"{v:,,{d}f}"
+    return "—" if v is None else f"{v:,.{d}f}"
 
 
 def gw(v):
