@@ -1,0 +1,16 @@
+{
+  "rpc_urls": [
+    "https://rpc.mainnet.chain.robinhood.com"
+  ],
+  "chain_id": 4663,
+  "window_hours": 12,
+  "max_window_hours": 48,
+  "fee_history_chunk": 1024,
+  "rpc_sleep_seconds": 0.05,
+  "defillama_chain_slugs": ["robinhood-chain", "robinhood"],
+  "defillama_arbitrum_slug": "arbitrum",
+  "blockscout_api": "https://robinhoodchain.blockscout.com/api",
+  "aep_recipient_address": "",
+  "aep_share": 0.10,
+  "trend_runs": 6
+}
