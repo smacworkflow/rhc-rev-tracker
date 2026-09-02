@@ -89,7 +89,7 @@ CSV_FIELDS = [
     "l1_pricing_surplus_eth",
     "llama_rev_24h_usd", "llama_arb_one_rev_24h_usd",
     "aep_recipient_inflow_eth",
-    "regime", "param_changes",
+    "regime", "param_changes", "fee_method",
 ]
 
 
@@ -139,6 +139,32 @@ class RPC:
                 self.i += 1
                 time.sleep(0.5 * (attempt + 1))
         raise RuntimeError(f"RPC failed for {method}: {last}")
+
+    def batch(self, calls, retries=3):
+        """JSON-RPC batch: calls = [(method, params), ...]. Returns list of results in order."""
+        payload = [{"jsonrpc": "2.0", "id": i, "method": m, "params": p} for i, (m, p) in enumerate(calls)]
+        last = None
+        for attempt in range(retries):
+            url = self.urls[self.i % len(self.urls)]
+            try:
+                out = http_json(url, payload, timeout=60)
+                self.calls += 1
+                if not isinstance(out, list):
+                    raise RuntimeError(f"batch: non-list response {str(out)[:120]}")
+                by_id = {o.get("id"): o for o in out}
+                res = []
+                for i in range(len(calls)):
+                    o = by_id.get(i)
+                    if o is None or "error" in o:
+                        raise RuntimeError(f"batch item {i}: {o.get('error') if o else 'missing'}")
+                    res.append(o["result"])
+                time.sleep(self.sleep)
+                return res
+            except Exception as e:  # noqa
+                last = e
+                self.i += 1
+                time.sleep(0.5 * (attempt + 1))
+        raise RuntimeError(f"RPC batch failed: {last}")
 
     def eth_call(self, to, selector, block="latest"):
         return self.call("eth_call", [{"to": to, "data": selector}, block])
@@ -208,19 +234,31 @@ def find_block_at(rpc, target_ts, lo, hi):
     return lo
 
 
-def fee_window(rpc, start_block, end_block, chunk, gas_limit):
+def fee_window(rpc, start_block, end_block, chunk, gas_limit, stride=20, batch_size=100):
     """
-    Sum baseFeePerGas * gasUsed over (start_block, end_block] via eth_feeHistory.
-    Returns (gas_used_total, rev_wei_total, blocks_counted, sum_basefee_wei).
+    Sum baseFeePerGas * gasUsed over (start_block, end_block].
+    Tries eth_feeHistory (exact, per block). Public Nitro RPCs only serve feeHistory
+    for the most recent few thousand blocks ("metadata is not found" beyond that), so on
+    that error the remaining range is reconstructed from block headers sampled every
+    `stride` blocks via batched eth_getBlockByNumber and scaled to the full range.
+    Returns (gas_used_total, rev_wei_total, blocks_counted, sum_basefee_wei, method).
     """
-    gas_total = 0
+    gas_total = 0.0
     rev_wei = 0.0
     fee_sum = 0
     n_blocks = 0
     newest = end_block
+    method = "feeHistory"
     while newest > start_block:
         count = min(chunk, newest - start_block)
-        fh = rpc.call("eth_feeHistory", [hex(count), hex(newest), []])
+        try:
+            fh = rpc.call("eth_feeHistory", [hex(count), hex(newest), []], retries=2)
+        except RuntimeError as e:
+            log(f"feeHistory unavailable at block {newest} ({str(e)[:80]}); falling back to sampled headers for ({start_block}, {newest}]")
+            g2, r2, n2, f2 = _header_window(rpc, start_block, newest, gas_limit, stride, batch_size)
+            gas_total += g2; rev_wei += r2; n_blocks += n2; fee_sum += f2
+            method = "feeHistory+headers" if n_blocks > n2 else "headers"
+            break
         base = [int(x, 16) for x in fh["baseFeePerGas"]]
         ratios = fh["gasUsedRatio"]
         oldest = int(fh["oldestBlock"], 16)
@@ -234,7 +272,41 @@ def fee_window(rpc, start_block, end_block, chunk, gas_limit):
             fee_sum += base[i]
             n_blocks += 1
         newest = oldest - 1
-    return int(gas_total), rev_wei, n_blocks, fee_sum
+    return int(gas_total), rev_wei, n_blocks, fee_sum, method
+
+
+def _header_window(rpc, start_block, end_block, gas_limit, stride, batch_size):
+    """Sample every `stride` blocks in (start_block, end_block], scale sums by stride."""
+    span = end_block - start_block
+    if span <= 0:
+        return 0, 0.0, 0, 0
+    stride = max(1, min(stride, span))
+    blocks = list(range(end_block, start_block, -stride))
+    gas = 0.0
+    rev = 0.0
+    fee = 0
+    n = 0
+    for i in range(0, len(blocks), batch_size):
+        part = blocks[i:i + batch_size]
+        try:
+            res = rpc.batch([("eth_getBlockByNumber", [hex(b), False]) for b in part])
+        except RuntimeError as e:
+            log(f"batch failed ({str(e)[:80]}); retrying this chunk with single calls")
+            res = [rpc.call("eth_getBlockByNumber", [hex(b), False]) for b in part]
+        for b in res:
+            if not b:
+                continue
+            bf = int(b.get("baseFeePerGas", "0x0"), 16)
+            gu = int(b.get("gasUsed", "0x0"), 16)
+            gas += gu
+            rev += bf * gu
+            fee += bf
+            n += 1
+    if n == 0:
+        raise RuntimeError("header sampling returned no blocks")
+    scale = span / n
+    log(f"sampled {n} headers over {span} blocks (stride {stride}, scale {scale:.1f}x)")
+    return gas * scale, rev * scale, span, int(fee * scale)
 
 
 # ----------------------------------------------------------------------
@@ -457,7 +529,9 @@ def main():
     window_hours = (end_ts - start_ts) / 3600 or 1e-9
     log(f"window blocks ({start_block}, {end_block}] = {end_block - start_block} blocks, {window_hours:.2f}h")
 
-    gas_used, rev_wei, n_blocks, fee_sum = fee_window(rpc, start_block, end_block, cfg["fee_history_chunk"], gas_limit)
+    gas_used, rev_wei, n_blocks, fee_sum, fee_method = fee_window(
+        rpc, start_block, end_block, cfg["fee_history_chunk"], gas_limit,
+        cfg.get("header_sample_stride", 20), cfg.get("rpc_batch_size", 100))
     log(f"gas_used={gas_used:,} rev={eth(rev_wei):.4f} ETH over {n_blocks} blocks ({rpc.calls} rpc calls)")
 
     params = read_params(rpc, hex(end_block))
@@ -487,6 +561,7 @@ def main():
         "llama_rev_24h_usd": llama_rev, "llama_arb_one_rev_24h_usd": llama_arb,
         "aep_recipient_inflow_eth": inflow,
         "rpc_calls": rpc.calls,
+        "fee_method": fee_method,
     }
     cur.update(params)
 
